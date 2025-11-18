@@ -15,10 +15,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен вашего бота от @BotFather
+BOT_TOKEN = "8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw"  # Токен вашего бота от @BotFather
 API_ID = 34926321
 API_HASH = '3ce3de5ab33d2defac471e34d47662e2'
-PHONE_NUMBER = 'YOUR_PHONE_NUMBER'  # Ваш номер телефона
+PHONE_NUMBER = '+77474314960'  # Ваш номер телефона
 
 # Глобальное состояние
 user_client = None
