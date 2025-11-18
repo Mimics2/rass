@@ -1,525 +1,334 @@
-# main.py
 import asyncio
 import logging
-import sqlite3
-import random
-import os
-import re
-from datetime import datetime
+from datetime import datetime, time, timedelta
+from typing import List, Dict
+import pytz
+from telethon import TelegramClient
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-try:
-    from telethon import TelegramClient, events
-    from telethon.tl.types import User
-except ImportError as e:
-    logger.error(f"❌ Ошибка импорта: {e}")
-    logger.info("📦 Устанавливаем зависимости...")
-    import subprocess
-    subprocess.check_call(["pip", "install", "telethon==1.28.5"])
-    from telethon import TelegramClient, events
-    from telethon.tl.types import User
+# Конфигурация
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен вашего бота от @BotFather
+API_ID = 34926321
+API_HASH = '3ce3de5ab33d2defac471e34d47662e2'
+PHONE_NUMBER = 'YOUR_PHONE_NUMBER'  # Ваш номер телефона
 
-# Конфигурация из переменных окружения
-API_ID = int(os.getenv('API_ID', '39123927'))
-API_HASH = os.getenv('API_HASH', 'e4395ce4c701ce5524192b0e1f96e7a5')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw')
+# Глобальное состояние
+user_client = None
+chats_list = []
+is_active = False
+scheduled_tasks = []
 
-# Проверка обязательных переменных
-if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN не установлен!")
-    logger.info("💡 Установите BOT_TOKEN в настройках Railway")
-    exit(1)
-
-logger.info("🚀 Инициализация бота...")
-
-class DatabaseManager:
-    def __init__(self, db_file='mass_sender.db'):
-        self.db_file = db_file
-        self.init_db()
+class UserAccountManager:
+    """Управление пользовательским аккаунтом через Telethon"""
     
-    def init_db(self):
-        """Инициализация базы данных"""
+    def __init__(self, api_id: int, api_hash: str):
+        self.client = TelegramClient('user_session', api_id, api_hash)
+        self.is_connected = False
+    
+    async def start(self):
+        """Запуск клиента пользователя"""
+        await self.client.start(phone=PHONE_NUMBER)
+        self.is_connected = True
+        me = await self.client.get_me()
+        logger.info(f"Пользовательский аккаунт запущен: {me.first_name}")
+        return me
+    
+    async def send_message_to_chat(self, chat_entity, message: str):
+        """Отправка сообщения в чат от имени пользователя"""
         try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    is_bot INTEGER DEFAULT 0,
-                    scraped_date TEXT,
-                    source_chat TEXT,
-                    is_active INTEGER DEFAULT 1
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS drafts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT,
-                    created_date TEXT
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sent_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    username TEXT,
-                    sent_date TEXT,
-                    message TEXT,
-                    status TEXT,
-                    attempts INTEGER DEFAULT 0,
-                    error_message TEXT
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS campaigns (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    draft_id INTEGER,
-                    status TEXT DEFAULT 'running',
-                    started_date TEXT,
-                    completed_date TEXT,
-                    total_users INTEGER,
-                    sent_count INTEGER DEFAULT 0,
-                    failed_count INTEGER DEFAULT 0,
-                    current_index INTEGER DEFAULT 0
-                )
-            ''')
-            
-            conn.commit()
-            conn.close()
-            logger.info("✅ База данных инициализирована")
-        except Exception as e:
-            logger.error(f"❌ Ошибка инициализации БД: {e}")
-    
-    def execute_query(self, query, params=()):
-        """Выполнение запроса"""
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
-            return cursor
-        except Exception as e:
-            logger.error(f"❌ Ошибка БД: {e}")
-            raise
-        finally:
-            conn.close()
-    
-    def fetch_all(self, query, params=()):
-        """Получение всех результатов"""
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return cursor.fetchall()
-        except Exception as e:
-            logger.error(f"❌ Ошибка БД: {e}")
-            return []
-        finally:
-            conn.close()
-    
-    def fetch_one(self, query, params=()):
-        """Получение одного результата"""
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return cursor.fetchone()
-        except Exception as e:
-            logger.error(f"❌ Ошибка БД: {e}")
-            return None
-        finally:
-            conn.close()
-
-class MassSenderBot:
-    def __init__(self):
-        self.db = DatabaseManager()
-        self.active_campaigns = {}
-        self.base_delay_min = 45
-        self.base_delay_max = 60
-        self.client = None
-    
-    def set_client(self, client):
-        """Установка клиента Telegram"""
-        self.client = client
-    
-    def is_valid_username(self, username):
-        """Проверка валидности username"""
-        if not username or not isinstance(username, str):
-            return False
-        
-        username = username.lstrip('@')
-        
-        if len(username) < 5 or len(username) > 32:
-            return False
-        
-        if not re.match(r'^[a-zA-Z0-9_]+$', username):
-            return False
-        
-        return True
-    
-    async def save_draft(self, text, user_id):
-        """Сохранение черновика"""
-        try:
-            self.db.execute_query(
-                'INSERT INTO drafts (text, created_date) VALUES (?, ?)',
-                (text, datetime.now().isoformat())
-            )
-            draft_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
-            
-            await self.client.send_message(user_id, f"✅ Черновик сохранен! ID: {draft_id}")
-            return draft_id
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка сохранения: {e}")
-            return None
-    
-    async def list_drafts(self, user_id):
-        """Показать список черновиков"""
-        try:
-            drafts = self.db.fetch_all('SELECT id, text, created_date FROM drafts ORDER BY id DESC')
-            
-            if not drafts:
-                await self.client.send_message(user_id, "📝 Черновиков нет")
-                return
-            
-            message = "📝 Ваши черновики:\n\n"
-            for draft_id, text, created_date in drafts:
-                preview = text[:50] + "..." if len(text) > 50 else text
-                message += f"🆔 {draft_id}: {preview}\n📅 {created_date[:16]}\n\n"
-            
-            await self.client.send_message(user_id, message)
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка: {e}")
-    
-    async def add_users_from_chat(self, chat_link, user_id):
-        """Добавление пользователей из чата"""
-        try:
-            await self.client.send_message(user_id, "🔄 Получаем информацию о чате...")
-            chat = await self.client.get_entity(chat_link)
-            
-            users_added = 0
-            invalid_users = 0
-            
-            async for user in self.client.iter_participants(chat, limit=200):
-                if user.username and not user.bot and self.is_valid_username(user.username):
-                    try:
-                        self.db.execute_query('''
-                            INSERT OR IGNORE INTO users 
-                            (user_id, username, first_name, last_name, is_bot, scraped_date, source_chat, is_active)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            user.id, user.username, user.first_name or '',
-                            user.last_name or '', 0, datetime.now().isoformat(),
-                            getattr(chat, 'title', 'Unknown'), 1
-                        ))
-                        users_added += 1
-                    except:
-                        continue
-                else:
-                    invalid_users += 1
-            
-            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE is_active = 1')[0] or 0
-            
-            await self.client.send_message(
-                user_id,
-                f"✅ Сбор завершен!\n"
-                f"👥 Добавлено: {users_added}\n"
-                f"📊 Всего в базе: {total_users}"
-            )
-            
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка: {str(e)[:200]}")
-    
-    async def start_campaign(self, draft_id, user_id):
-        """Запуск рассылки"""
-        try:
-            draft = self.db.fetch_one('SELECT text FROM drafts WHERE id = ?', (draft_id,))
-            if not draft:
-                await self.client.send_message(user_id, "❌ Черновик не найден")
-                return
-            
-            message_text = draft[0]
-            
-            users = self.db.fetch_all('''
-                SELECT u.user_id, u.username FROM users u
-                WHERE u.is_bot = 0 AND u.is_active = 1
-                AND u.user_id NOT IN (
-                    SELECT user_id FROM sent_messages WHERE message = ? AND status = 'success'
-                )
-            ''', (message_text,))
-            
-            if not users:
-                await self.client.send_message(user_id, "❌ Нет пользователей для отправки")
-                return
-            
-            valid_users = [(uid, uname) for uid, uname in users if self.is_valid_username(uname)]
-            
-            if not valid_users:
-                await self.client.send_message(user_id, "❌ Нет валидных пользователей")
-                return
-            
-            self.db.execute_query(
-                'INSERT INTO campaigns (draft_id, started_date, total_users) VALUES (?, ?, ?)',
-                (draft_id, datetime.now().isoformat(), len(valid_users))
-            )
-            
-            campaign_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
-            
-            self.active_campaigns[campaign_id] = {'status': 'running', 'admin_id': user_id}
-            
-            asyncio.create_task(self.run_campaign(campaign_id, user_id, valid_users, message_text))
-            
-            await self.client.send_message(
-                user_id,
-                f"🚀 Рассылка #{campaign_id} запущена!\n"
-                f"👥 Получателей: {len(valid_users)}\n"
-                f"⏳ Задержка: {self.base_delay_min}-{self.base_delay_max} сек"
-            )
-            
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка запуска: {e}")
-    
-    async def run_campaign(self, campaign_id, admin_id, users, message_text):
-        """Выполнение рассылки"""
-        success_count = 0
-        failed_count = 0
-        
-        for i, (user_id, username) in enumerate(users, 1):
-            try:
-                if (campaign_id not in self.active_campaigns or 
-                    self.active_campaigns[campaign_id]['status'] == 'stopped'):
-                    break
-                
-                sent = await self.send_message(user_id, username, message_text)
-                
-                if sent:
-                    success_count += 1
-                    logger.info(f"✅ [{i}/{len(users)}] @{username}")
-                else:
-                    failed_count += 1
-                    logger.info(f"❌ [{i}/{len(users)}] @{username}")
-                
-                self.db.execute_query(
-                    'UPDATE campaigns SET sent_count = ?, failed_count = ?, current_index = ? WHERE id = ?',
-                    (success_count, failed_count, i, campaign_id)
-                )
-                
-                if i % 10 == 0:
-                    await self.update_progress(campaign_id, admin_id, i, len(users), success_count, failed_count)
-                
-                delay = random.randint(self.base_delay_min, self.base_delay_max)
-                await asyncio.sleep(delay)
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка: {e}")
-                failed_count += 1
-                continue
-        
-        campaign_status = 'completed'
-        if campaign_id in self.active_campaigns:
-            if self.active_campaigns[campaign_id]['status'] == 'stopped':
-                campaign_status = 'stopped'
-            self.active_campaigns.pop(campaign_id)
-        
-        self.db.execute_query(
-            'UPDATE campaigns SET status = ?, completed_date = ? WHERE id = ?',
-            (campaign_status, datetime.now().isoformat(), campaign_id)
-        )
-        
-        await self.send_final_report(campaign_id, admin_id, success_count, failed_count, len(users))
-    
-    async def send_message(self, user_id, username, message_text):
-        """Отправка сообщения (одна попытка)"""
-        try:
-            await self.client.send_message(username, message_text)
-            
-            self.db.execute_query('''
-                INSERT INTO sent_messages 
-                (user_id, username, sent_date, message, status, attempts)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, username, datetime.now().isoformat(), message_text, 'success', 1))
-            
+            await self.client.send_message(chat_entity, message)
             return True
-            
         except Exception as e:
-            error_msg = str(e)
-            logger.warning(f"❌ Ошибка @{username}: {error_msg}")
-            
-            if any(x in error_msg for x in ["Invalid peer", "USERNAME_NOT_OCCUPIED", "USER_BLOCKED"]):
-                self.db.execute_query('UPDATE users SET is_active = 0 WHERE user_id = ?', (user_id,))
-            
-            self.db.execute_query('''
-                INSERT INTO sent_messages 
-                (user_id, username, sent_date, message, status, attempts, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, username, datetime.now().isoformat(), message_text, 'failed', 1, error_msg))
-            
+            logger.error(f"Ошибка отправки: {e}")
             return False
     
-    async def update_progress(self, campaign_id, admin_id, current, total, success, failed):
-        """Обновление прогресса"""
+    async def get_chat_by_link(self, chat_link: str):
+        """Получение чата по ссылке или username"""
         try:
-            progress = (current / total) * 100
-            await self.client.send_message(
-                admin_id,
-                f"📊 Рассылка #{campaign_id}\n"
-                f"📈 Прогресс: {current}/{total} ({progress:.1f}%)\n"
-                f"✅ Успешно: {success}\n"
-                f"❌ Ошибок: {failed}"
-            )
+            chat = await self.client.get_entity(chat_link)
+            return chat
         except Exception as e:
-            logger.error(f"Ошибка отправки прогресса: {e}")
+            logger.error(f"Ошибка получения чата: {e}")
+            return None
+
+# Команды для бота
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    instructions = """
+🤖 **Бот управления рассылкой BaroHolog**
+
+**Доступные команды:**
+
+📝 `/add_chats` - Добавить чаты для рассылки
+▶️ `/start_bot` - Запуск автоматической рассылки  
+🛑 `/stop_bot` - Остановить рассылку
+📊 `/status` - Проверить статус
+
+**Расписание рассылки:**
+⏰ 09:00 по Москве - первая публикация
+⏰ 17:00 по Москве - вторая публикация
+
+**Важно:** Сообщения отправляются от вашего личного аккаунта!
+    """
+    await update.message.reply_text(instructions)
+
+async def add_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /add_chats"""
+    global user_client, chats_list
     
-    async def send_final_report(self, campaign_id, admin_id, success, failed, total):
-        """Финальный отчет"""
-        try:
-            efficiency = (success / total) * 100 if total > 0 else 0
-            await self.client.send_message(
-                admin_id,
-                f"🎉 Рассылка #{campaign_id} завершена!\n"
-                f"✅ Успешно: {success}\n"
-                f"❌ Ошибок: {failed}\n"
-                f"📊 Эффективность: {efficiency:.1f}%"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка финального отчета: {e}")
-    
-    async def get_stats(self, user_id):
-        """Получение статистики"""
-        try:
-            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE is_active = 1')[0] or 0
-            total_sent = self.db.fetch_one('SELECT COUNT(*) FROM sent_messages WHERE status = "success"')[0] or 0
-            total_campaigns = self.db.fetch_one('SELECT COUNT(*) FROM campaigns')[0] or 0
-            
-            await self.client.send_message(
-                user_id,
-                f"📊 Статистика:\n"
-                f"👥 Пользователей: {total_users}\n"
-                f"📤 Отправлено: {total_sent}\n"
-                f"📝 Рассылок: {total_campaigns}"
-            )
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка статистики: {e}")
-    
-    async def stop_campaign(self, campaign_id, user_id):
-        """Остановка рассылки"""
-        try:
-            campaign_id = int(campaign_id)
-            if campaign_id in self.active_campaigns:
-                self.active_campaigns[campaign_id]['status'] = 'stopped'
-                await self.client.send_message(user_id, f"🛑 Рассылка #{campaign_id} остановлена!")
-            else:
-                await self.client.send_message(user_id, "❌ Рассылка не найдена")
-        except Exception as e:
-            await self.client.send_message(user_id, f"❌ Ошибка: {e}")
-
-# Инициализация бота
-mass_bot = MassSenderBot()
-
-@client.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    user = await event.get_sender()
-    await event.reply(
-        f"👋 Привет, {user.first_name}!\n\n"
-        "📋 Команды:\n"
-        "/add_chat - Добавить пользователей\n"
-        "/save_draft - Сохранить сообщение\n"
-        "/list_drafts - Список сообщений\n"
-        "/start_campaign - Начать рассылку\n"
-        "/stats - Статистика\n"
-        "/stop_campaign ID - Остановить\n"
-        "/help - Помощь"
-    )
-
-@client.on(events.NewMessage(pattern='/help'))
-async def help_handler(event):
-    await event.reply(
-        "📖 Инструкция:\n\n"
-        "1. /add_chat - добавить пользователей\n"
-        "2. /save_draft - сохранить текст\n"
-        "3. /start_campaign - начать рассылку\n\n"
-        "⚡ Одна попытка отправки, задержка 45-60 сек"
-    )
-
-@client.on(events.NewMessage(pattern='/add_chat'))
-async def add_chat_handler(event):
-    async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message("🔗 Пришлите ссылку на чат:")
-        try:
-            response = await conv.get_response()
-            await mass_bot.add_users_from_chat(response.text, event.chat_id)
-        except asyncio.TimeoutError:
-            await conv.send_message("⏰ Время истекло")
-
-@client.on(events.NewMessage(pattern='/save_draft'))
-async def save_draft_handler(event):
-    async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message("📝 Пришлите текст:")
-        try:
-            response = await conv.get_response()
-            await mass_bot.save_draft(response.text, event.chat_id)
-        except asyncio.TimeoutError:
-            await conv.send_message("⏰ Время истекло")
-
-@client.on(events.NewMessage(pattern='/list_drafts'))
-async def list_drafts_handler(event):
-    await mass_bot.list_drafts(event.chat_id)
-
-@client.on(events.NewMessage(pattern='/start_campaign'))
-async def start_campaign_handler(event):
-    async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message("🔢 Введите ID черновика:")
-        try:
-            response = await conv.get_response()
-            draft_id = int(response.text)
-            await mass_bot.start_campaign(draft_id, event.chat_id)
-        except ValueError:
-            await conv.send_message("❌ Неверный ID")
-        except asyncio.TimeoutError:
-            await conv.send_message("⏰ Время истекло")
-
-@client.on(events.NewMessage(pattern='/stats'))
-async def stats_handler(event):
-    await mass_bot.get_stats(event.chat_id)
-
-@client.on(events.NewMessage(pattern=r'/stop_campaign(\s+\d+)?'))
-async def stop_campaign_handler(event):
-    command_parts = event.text.split()
-    if len(command_parts) == 1:
-        await event.reply("🛑 Укажите ID: /stop_campaign 1")
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Добавление чатов**\n\n"
+            "Использование: `/add_chats @username1 @username2`\n\n"
+            "Или: `/add_chats https://t.me/username`\n\n"
+            "Пример: `/add_chats @my_channel @my_group`",
+            parse_mode='Markdown'
+        )
         return
-    try:
-        await mass_bot.stop_campaign(command_parts[1], event.chat_id)
-    except Exception as e:
-        await event.reply(f"❌ Ошибка: {e}")
+    
+    if not user_client or not user_client.is_connected:
+        await update.message.reply_text("❌ Пользовательский аккаунт не подключен")
+        return
+    
+    added_chats = []
+    failed_chats = []
+    
+    for chat_link in context.args:
+        try:
+            chat = await user_client.get_chat_by_link(chat_link)
+            if chat:
+                chat_info = {
+                    'id': chat.id,
+                    'title': getattr(chat, 'title', 'Private Chat'),
+                    'username': getattr(chat, 'username', None),
+                    'entity': chat
+                }
+                
+                # Проверяем, не добавлен ли уже
+                if not any(c['id'] == chat_info['id'] for c in chats_list):
+                    chats_list.append(chat_info)
+                    added_chats.append(chat_info['title'])
+                else:
+                    failed_chats.append(f"{chat_link} (уже добавлен)")
+            else:
+                failed_chats.append(chat_link)
+        except Exception as e:
+            failed_chats.append(f"{chat_link} (ошибка: {str(e)})")
+    
+    response = ""
+    if added_chats:
+        response += f"✅ Добавлены чаты: {', '.join(added_chats)}\n"
+    if failed_chats:
+        response += f"❌ Не удалось добавить: {', '.join(failed_chats)}\n"
+    
+    response += f"📊 Всего чатов: {len(chats_list)}"
+    await update.message.reply_text(response)
+
+async def start_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start_bot"""
+    global is_active, chats_list, user_client
+    
+    if not user_client or not user_client.is_connected:
+        await update.message.reply_text("❌ Пользовательский аккаунт не подключен")
+        return
+        
+    if not chats_list:
+        await update.message.reply_text("❌ Сначала добавьте чаты с помощью /add_chats")
+        return
+        
+    if is_active:
+        await update.message.reply_text("❌ Рассылка уже активна")
+        return
+    
+    is_active = True
+    asyncio.create_task(setup_schedule())
+    
+    chat_names = "\n".join([f"• {chat['title']}" for chat in chats_list])
+    
+    await update.message.reply_text(
+        f"✅ **Рассылка запущена!**\n\n"
+        f"📊 Чатов для рассылки: {len(chats_list)}\n"
+        f"⏰ Расписание: 09:00 и 17:00 по Москве\n"
+        f"📢 Публикаций в день: 2\n\n"
+        f"Чаты:\n{chat_names}"
+    )
+
+async def stop_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остановка рассылки"""
+    global is_active
+    
+    if not is_active:
+        await update.message.reply_text("❌ Рассылка и так не активна")
+        return
+        
+    is_active = False
+    for task in scheduled_tasks:
+        task.cancel()
+    scheduled_tasks.clear()
+    
+    await update.message.reply_text("🛑 Рассылка остановлена")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /status"""
+    global is_active, chats_list, user_client
+    
+    user_status = "🟢 Подключен" if user_client and user_client.is_connected else "🔴 Не подключен"
+    bot_status = "🟢 Активна" if is_active else "🔴 Не активна"
+    
+    status_message = (
+        f"🤖 **Статус системы BaroHolog**\n\n"
+        f"👤 Пользовательский аккаунт: {user_status}\n"
+        f"📊 Рассылка: {bot_status}\n"
+        f"👥 Чатов в списке: {len(chats_list)}\n"
+        f"⏰ Время проверки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    
+    if chats_list:
+        status_message += "\n📋 Чаты:\n" + "\n".join([f"• {chat['title']}" for chat in chats_list[:3]])
+        if len(chats_list) > 3:
+            status_message += f"\n... и еще {len(chats_list) - 3} чатов"
+    
+    await update.message.reply_text(status_message)
+
+# Функции рассылки
+async def setup_schedule():
+    """Настройка расписания рассылки"""
+    global scheduled_tasks
+    
+    # Очищаем предыдущие задачи
+    for task in scheduled_tasks:
+        task.cancel()
+    scheduled_tasks.clear()
+    
+    # Создаем задачи для двух времен
+    times = [time(9, 0), time(17, 0)]  # 09:00 и 17:00 по Москве
+    
+    for send_time in times:
+        task = asyncio.create_task(schedule_sender(send_time))
+        scheduled_tasks.append(task)
+
+async def schedule_sender(send_time: time):
+    """Планировщик рассылки для конкретного времени"""
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    
+    while is_active:
+        try:
+            now = datetime.now(moscow_tz)
+            target_time = moscow_tz.localize(datetime.combine(now.date(), send_time))
+            
+            # Если время уже прошло сегодня, планируем на завтра
+            if now > target_time:
+                target_time += timedelta(days=1)
+            
+            wait_seconds = (target_time - now).total_seconds()
+            logger.info(f"Следующая рассылка в {send_time} через {wait_seconds:.0f} секунд")
+            
+            # Ждем до времени рассылки
+            await asyncio.sleep(wait_seconds)
+            
+            if is_active:
+                await send_messages()
+            
+            # Ждем до следующего дня
+            await asyncio.sleep(86400 - wait_seconds)
+            
+        except Exception as e:
+            logger.error(f"Ошибка в планировщике: {e}")
+            await asyncio.sleep(60)
+
+async def send_messages():
+    """Отправка сообщений во все чаты от имени пользователя"""
+    global chats_list, is_active, user_client
+    
+    if not is_active or not chats_list or not user_client:
+        return
+        
+    logger.info(f"Начало рассылки в {len(chats_list)} чатов")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for chat_info in chats_list:
+        try:
+            message_text = """
+📢 **Рекламное сообщение BaroHolog** 📢
+
+Ваше рекламное сообщение здесь...
+
+✨ Преимущества:
+• Высокое качество
+• Быстрая доставка  
+• Отличная поддержка
+
+📞 Контакты: ваш контакт
+            """
+            
+            success = await user_client.send_message_to_chat(
+                chat_info['entity'], 
+                message_text
+            )
+            
+            if success:
+                success_count += 1
+                logger.info(f"Сообщение отправлено в {chat_info['title']}")
+            else:
+                fail_count += 1
+                
+            # Пауза между отправками
+            await asyncio.sleep(3)
+            
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"Ошибка отправки в {chat_info['title']}: {e}")
+    
+    # Отправляем отчет через бота
+    report_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    report_message = (
+        f"📊 **Отчет о рассылке**\n\n"
+        f"⏰ Время: {report_time}\n"
+        f"✅ Успешно: {success_count}\n"
+        f"❌ Ошибок: {fail_count}\n"
+        f"📊 Всего чатов: {len(chats_list)}"
+    )
+    
+    # Здесь можно отправить отчет конкретному пользователю
+    # Для примера отправляем в тот же чат где была команда
+    # В реальности лучше хранить ID администратора
 
 async def main():
-    """Основная функция"""
-    try:
-        logger.info("🚀 Запуск бота...")
-        client = TelegramClient('mass_sender_bot', API_ID, API_HASH)
-        await client.start(bot_token=BOT_TOKEN)
-        
-        mass_bot.set_client(client)
-        
-        me = await client.get_me()
-        logger.info(f"✅ Бот @{me.username} запущен!")
-        
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
+    """Основная функция запуска"""
+    global user_client
+    
+    # Инициализация пользовательского клиента
+    user_client = UserAccountManager(API_ID, API_HASH)
+    await user_client.start()
+    
+    # Инициализация бота
+    bot_application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики команд
+    bot_application.add_handler(CommandHandler("start", start_command))
+    bot_application.add_handler(CommandHandler("add_chats", add_chats_command))
+    bot_application.add_handler(CommandHandler("start_bot", start_bot_command))
+    bot_application.add_handler(CommandHandler("stop_bot", stop_bot_command))
+    bot_application.add_handler(CommandHandler("status", status_command))
+    
+    # Запускаем бота
+    logger.info("Бот запускается...")
+    await bot_application.initialize()
+    await bot_application.start()
+    await bot_application.updater.start_polling()
+    
+    # Бесконечный цикл
+    await asyncio.Future()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
