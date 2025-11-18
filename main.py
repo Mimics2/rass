@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 API_ID = 39123927
 API_HASH = 'e4395ce4c701ce5524192b0e1f96e7a5'
-BOT_TOKEN = 'YOUR_BOT_TOKEN'  # Замените на токен вашего бота
+BOT_TOKEN = '8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw'  # Замените на токен вашего бота
 
 # Инициализация клиента
 client = TelegramClient('bot_session', API_ID, API_HASH)
