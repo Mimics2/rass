@@ -1,0 +1,5 @@
+# requirements.txt
+telethon==1.28.5
+pandas==2.0.3
+apscheduler==3.10.4
+sqlite3
