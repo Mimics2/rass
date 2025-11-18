@@ -3,10 +3,10 @@ import asyncio
 import logging
 import sqlite3
 import random
+import os
 from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.tl.types import User
-import pandas as pd
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,10 +15,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация (замените на свои данные)
-API_ID = 39123927
-API_HASH = 'e4395ce4c701ce5524192b0e1f96e7a5'
-BOT_TOKEN = '8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw'  # Получите у @BotFather
+# Конфигурация из переменных окружения
+API_ID = int(os.getenv('API_ID', '39123927'))
+API_HASH = os.getenv('API_HASH', 'e4395ce4c701ce5524192b0e1f96e7a5')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+
+# Проверка обязательных переменных
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN не установлен! Задайте его в переменных окружения.")
+    exit(1)
+
+if not API_ID or not API_HASH:
+    logger.error("❌ API_ID или API_HASH не установлены!")
+    exit(1)
 
 # Инициализация клиента
 client = TelegramClient('mass_sender_bot', API_ID, API_HASH)
@@ -125,9 +134,9 @@ class DatabaseManager:
 class MassSenderBot:
     def __init__(self):
         self.db = DatabaseManager()
-        self.active_campaigns = {}  # Храним активные кампании для остановки
-        self.max_attempts = 2  # Уменьшил количество попыток для скорости
-        self.base_delay = 25
+        self.active_campaigns = {}
+        self.base_delay_min = 45  # Минимальная задержка
+        self.base_delay_max = 60  # Максимальная задержка
     
     async def save_draft(self, text, user_id):
         """Сохранение черновика"""
@@ -191,13 +200,12 @@ class MassSenderBot:
                             user.id, user.username,
                             user.first_name or '',
                             user.last_name or '',
-                            0,  # is_bot
+                            0,
                             datetime.now().isoformat(),
                             getattr(chat, 'title', 'Unknown')
                         ))
                         users_added += 1
                     except Exception as e:
-                        logger.warning(f"Ошибка добавления пользователя {user.username}: {e}")
                         continue
             
             total_users = self.db.fetch_one('SELECT COUNT(*) FROM users')[0]
@@ -212,7 +220,7 @@ class MassSenderBot:
         except Exception as e:
             await client.send_message(
                 user_id, 
-                f"❌ Ошибка: {e}\n\n"
+                f"❌ Ошибка: {str(e)[:200]}\n\n"
                 "💡 Проверьте:\n"
                 "- Ссылку на чат\n"
                 "- Права доступа\n"
@@ -222,7 +230,6 @@ class MassSenderBot:
     async def start_campaign(self, draft_id, user_id):
         """Запуск рассылки"""
         try:
-            # Проверяем черновик
             draft = self.db.fetch_one(
                 'SELECT text FROM drafts WHERE id = ?', 
                 (draft_id,)
@@ -234,7 +241,6 @@ class MassSenderBot:
             
             message_text = draft[0]
             
-            # Получаем пользователей для отправки (тех, кому еще не отправляли это сообщение)
             users = self.db.fetch_all('''
                 SELECT u.user_id, u.username 
                 FROM users u
@@ -248,7 +254,6 @@ class MassSenderBot:
                 await client.send_message(user_id, "❌ Нет пользователей для отправки")
                 return
             
-            # Создаем кампанию
             self.db.execute_query('''
                 INSERT INTO campaigns (draft_id, started_date, total_users, current_index)
                 VALUES (?, ?, ?, ?)
@@ -256,13 +261,11 @@ class MassSenderBot:
             
             campaign_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
             
-            # Сохраняем кампанию в активных
             self.active_campaigns[campaign_id] = {
                 'status': 'running',
                 'admin_id': user_id
             }
             
-            # Запускаем рассылку в фоне
             asyncio.create_task(self.run_campaign(campaign_id, user_id, users, message_text))
             
             await client.send_message(
@@ -270,7 +273,7 @@ class MassSenderBot:
                 f"🚀 Рассылка #{campaign_id} запущена!\n"
                 f"📝 Сообщение: {message_text[:80]}...\n"
                 f"👥 Получателей: {len(users)}\n"
-                f"⏳ Начинаем отправку...\n\n"
+                f"⏳ Задержка: {self.base_delay_min}-{self.base_delay_max} сек\n"
                 f"🛑 Для остановки: /stop_campaign {campaign_id}"
             )
             
@@ -285,12 +288,11 @@ class MassSenderBot:
         for i, (user_id, username) in enumerate(users, 1):
             try:
                 # Проверяем не остановлена ли кампания
-                if campaign_id in self.active_campaigns:
-                    if self.active_campaigns[campaign_id]['status'] == 'stopped':
-                        logger.info(f"🛑 Рассылка {campaign_id} остановлена администратором")
-                        break
-                else:
-                    logger.info(f"🛑 Рассылка {campaign_id} не найдена в активных")
+                if campaign_id not in self.active_campaigns:
+                    break
+                    
+                if self.active_campaigns[campaign_id]['status'] == 'stopped':
+                    logger.info(f"🛑 Рассылка {campaign_id} остановлена")
                     break
                 
                 # Обновляем текущий индекс в БД
@@ -299,15 +301,15 @@ class MassSenderBot:
                     (i, campaign_id)
                 )
                 
-                # Пытаемся отправить сообщение (с пропуском при ошибке)
-                sent = await self.send_with_retry(user_id, username, message_text)
+                # Пытаемся отправить сообщение (ОДНА попытка)
+                sent = await self.send_message(user_id, username, message_text)
                 
                 if sent:
                     success_count += 1
                     logger.info(f"✅ [{i}/{len(users)}] Отправлено @{username}")
                 else:
                     failed_count += 1
-                    logger.info(f"❌ [{i}/{len(users)}] Пропущен @{username} после {self.max_attempts} попыток")
+                    logger.info(f"❌ [{i}/{len(users)}] Пропущен @{username}")
                 
                 # Обновляем статистику в БД
                 self.db.execute_query('''
@@ -322,22 +324,23 @@ class MassSenderBot:
                         success_count, failed_count
                     )
                 
-                # Случайная задержка между сообщениями
-                delay = random.randint(self.base_delay, self.base_delay + 20)
+                # Случайная задержка между сообщениями (45-60 секунд)
+                delay = random.randint(self.base_delay_min, self.base_delay_max)
+                logger.info(f"⏳ Ожидание {delay} секунд до следующего сообщения...")
                 await asyncio.sleep(delay)
                 
             except Exception as e:
                 logger.error(f"❌ Критическая ошибка в кампании {campaign_id} для @{username}: {e}")
                 failed_count += 1
-                # Пропускаем пользователя и продолжаем
+                # Продолжаем со следующим пользователем
                 continue
         
         # Завершаем кампанию
+        campaign_status = 'completed'
         if campaign_id in self.active_campaigns:
-            campaign_status = 'completed'
+            if self.active_campaigns[campaign_id]['status'] == 'stopped':
+                campaign_status = 'stopped'
             self.active_campaigns.pop(campaign_id)
-        else:
-            campaign_status = 'stopped'
         
         self.db.execute_query('''
             UPDATE campaigns 
@@ -347,60 +350,38 @@ class MassSenderBot:
         
         await self.send_final_report(campaign_id, admin_id, success_count, failed_count, len(users))
     
-    async def send_with_retry(self, user_id, username, message_text):
-        """Отправка с повторными попытками, пропускает пользователя после неудач"""
-        last_error = ""
-        
-        for attempt in range(self.max_attempts):
-            try:
-                await client.send_message(username, message_text)
-                
-                # Сохраняем успешную отправку
-                self.db.execute_query('''
-                    INSERT INTO sent_messages 
-                    (user_id, username, sent_date, message, status, attempts)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    user_id, username, datetime.now().isoformat(),
-                    message_text, 'success', attempt + 1
-                ))
-                
-                return True
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"❌ Попытка {attempt + 1} для @{username}: {last_error}")
-                
-                # Обработка специфических ошибок
-                if "FLOOD_WAIT" in last_error:
-                    try:
-                        wait_time = int(last_error.split()[-1])
-                        logger.info(f"⏳ FLOOD_WAIT: ждем {wait_time} секунд")
-                        await asyncio.sleep(wait_time + 5)
-                    except:
-                        await asyncio.sleep(60)
-                elif any(x in last_error for x in ["USERNAME_NOT_OCCUPIED", "USER_BLOCKED", "CHAT_WRITE_FORBIDDEN"]):
-                    # Бесполезно повторять для этих ошибок - сразу пропускаем
-                    break
-                elif "AUTH_KEY" in last_error:
-                    # Критическая ошибка аутентификации
-                    raise
-                else:
-                    # Увеличивающаяся задержка для других ошибок
-                    wait_time = 10 * (attempt + 1)
-                    await asyncio.sleep(wait_time)
-        
-        # Сохраняем неудачную отправку (пропускаем пользователя)
-        self.db.execute_query('''
-            INSERT INTO sent_messages 
-            (user_id, username, sent_date, message, status, attempts, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, username, datetime.now().isoformat(),
-            message_text, 'failed', self.max_attempts, last_error
-        ))
-        
-        return False
+    async def send_message(self, user_id, username, message_text):
+        """Отправка сообщения (ОДНА попытка)"""
+        try:
+            await client.send_message(username, message_text)
+            
+            # Сохраняем успешную отправку
+            self.db.execute_query('''
+                INSERT INTO sent_messages 
+                (user_id, username, sent_date, message, status, attempts)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, username, datetime.now().isoformat(),
+                message_text, 'success', 1
+            ))
+            
+            return True
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"❌ Ошибка отправки @{username}: {error_msg}")
+            
+            # Сохраняем неудачную отправку (пропускаем пользователя)
+            self.db.execute_query('''
+                INSERT INTO sent_messages 
+                (user_id, username, sent_date, message, status, attempts, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, username, datetime.now().isoformat(),
+                message_text, 'failed', 1, error_msg
+            ))
+            
+            return False
     
     async def update_progress(self, campaign_id, admin_id, current, total, success, failed):
         """Обновление прогресса"""
@@ -412,7 +393,7 @@ class MassSenderBot:
                 f"📈 Прогресс: {current}/{total} ({progress:.1f}%)\n"
                 f"✅ Успешно: {success}\n"
                 f"❌ Пропущено: {failed}\n"
-                f"🛑 Остановить: /stop_campaign {campaign_id}"
+                f"⏱ Задержка: {self.base_delay_min}-{self.base_delay_max} сек"
             )
         except Exception as e:
             logger.error(f"Ошибка отправки прогресса: {e}")
@@ -436,14 +417,13 @@ class MassSenderBot:
     async def get_stats(self, user_id):
         """Получение статистики"""
         try:
-            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users')[0]
+            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users')[0] or 0
             total_sent = self.db.fetch_one(
                 'SELECT COUNT(*) FROM sent_messages WHERE status = "success"'
-            )[0]
-            total_campaigns = self.db.fetch_one('SELECT COUNT(*) FROM campaigns')[0]
-            total_drafts = self.db.fetch_one('SELECT COUNT(*) FROM drafts')[0]
+            )[0] or 0
+            total_campaigns = self.db.fetch_one('SELECT COUNT(*) FROM campaigns')[0] or 0
+            total_drafts = self.db.fetch_one('SELECT COUNT(*) FROM drafts')[0] or 0
             
-            # Активные рассылки
             active_campaigns = self.db.fetch_all(
                 'SELECT id, total_users, sent_count, failed_count FROM campaigns WHERE status = "running"'
             )
@@ -453,7 +433,8 @@ class MassSenderBot:
                 f"👥 Пользователей в базе: {total_users}\n"
                 f"📤 Успешно отправлено: {total_sent}\n"
                 f"📝 Проведено рассылок: {total_campaigns}\n"
-                f"📄 Черновиков: {total_drafts}"
+                f"📄 Черновиков: {total_drafts}\n"
+                f"⏱ Задержка между сообщениями: {self.base_delay_min}-{self.base_delay_max} сек"
             )
             
             if active_campaigns:
@@ -474,7 +455,6 @@ class MassSenderBot:
             if campaign_id in self.active_campaigns:
                 self.active_campaigns[campaign_id]['status'] = 'stopped'
                 
-                # Обновляем статус в БД
                 self.db.execute_query(
                     'UPDATE campaigns SET status = "stopped" WHERE id = ?',
                     (campaign_id,)
@@ -483,11 +463,10 @@ class MassSenderBot:
                 await client.send_message(
                     user_id, 
                     f"🛑 Рассылка #{campaign_id} остановлена!\n"
-                    f"⏳ Завершаем текущее сообщение и сохраняем прогресс..."
+                    f"⏳ Завершаем текущее сообщение..."
                 )
-                logger.info(f"Рассылка #{campaign_id} остановлена пользователем {user_id}")
+                logger.info(f"Рассылка #{campaign_id} остановлена")
             else:
-                # Проверяем существует ли такая кампания
                 campaign = self.db.fetch_one(
                     'SELECT status FROM campaigns WHERE id = ?', 
                     (campaign_id,)
@@ -526,6 +505,7 @@ class MassSenderBot:
                     f"🆔 #{camp_id}\n"
                     f"📊 Прогресс: {sent}/{total} ({progress:.1f}%)\n"
                     f"📍 Текущий: {current}\n"
+                    f"⏱ Задержка: {self.base_delay_min}-{self.base_delay_max} сек\n"
                     f"🛑 Остановить: /stop_campaign {camp_id}\n\n"
                 )
             
@@ -536,7 +516,6 @@ class MassSenderBot:
 # Инициализация бота
 mass_bot = MassSenderBot()
 
-# Обработчики команд
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """Обработчик команды /start"""
@@ -554,45 +533,32 @@ async def start_handler(event):
         "/stop_campaign ID - Остановить рассылку\n"
         "/help - Помощь\n\n"
         "⚡ Особенности:\n"
-        "• Автоповтор при ошибках\n"
-        "• Пропуск проблемных пользователей\n"
-        "• Рабочая остановка рассылки\n"
-        "• Защита от блокировки"
+        "• ОДНА попытка отправки - при ошибке пользователь пропускается\n"
+        "• Задержка 45-60 секунд между сообщениями\n"
+        "• Без дополнительных задержек при ошибках"
     )
 
 @client.on(events.NewMessage(pattern='/help'))
 async def help_handler(event):
     """Обработчик команды /help"""
     await event.reply(
-        "📖 Инструкция по использованию:\n\n"
-        "1. 🏷️ Добавьте пользователей:\n"
-        "   /add_chat - из чата по ссылке\n\n"
-        "2. 💾 Сохраните сообщение:\n"
-        "   /save_draft - текст для рассылки\n\n"
-        "3. 🚀 Запустите рассылку:\n"
-        "   /start_campaign - выберите сообщение\n\n"
-        "4. 🛑 Управление рассылкой:\n"
-        "   /active_campaigns - список активных\n"
-        "   /stop_campaign ID - остановить\n\n"
-        "⚙️ Бот автоматически:\n"
-        "• Пропускает пользователей при ошибках\n"
-        "• Сохраняет прогресс при остановке\n"
-        "• Соблюдает задержки\n"
-        "• Сохраняет статистику\n\n"
-        "⏱ Задержки: 25-45 секунд между сообщениями"
+        "📖 Инструкция:\n\n"
+        "1. /add_chat - добавить пользователей из чата\n"
+        "2. /save_draft - сохранить текст рассылки\n"
+        "3. /start_campaign - начать рассылку\n"
+        "4. /stop_campaign ID - остановить рассылку\n\n"
+        "⚡ Особенности работы:\n"
+        "• При первой же ошибке пользователь пропускается\n"
+        "• Задержка между сообщениями: 45-60 секунд\n"
+        "• Нет дополнительных задержек при ошибках\n"
+        "• Можно остановить рассылку в любой момент"
     )
 
 @client.on(events.NewMessage(pattern='/add_chat'))
 async def add_chat_handler(event):
     """Добавление пользователей из чата"""
     async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message(
-            "🔗 Пришлите ссылку на чат/канал:\n\n"
-            "Примеры:\n"
-            "• https://t.me/chat_username\n"
-            "• @chat_username"
-        )
-        
+        await conv.send_message("🔗 Пришлите ссылку на чат/канал:")
         try:
             response = await conv.get_response()
             await mass_bot.add_users_from_chat(response.text, event.chat_id)
@@ -603,11 +569,7 @@ async def add_chat_handler(event):
 async def save_draft_handler(event):
     """Сохранение черновика"""
     async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message(
-            "📝 Пришлите текст для рассылки:\n\n"
-            "Можно использовать эмодзи и разметку."
-        )
-        
+        await conv.send_message("📝 Пришлите текст для рассылки:")
         try:
             response = await conv.get_response()
             await mass_bot.save_draft(response.text, event.chat_id)
@@ -624,7 +586,6 @@ async def start_campaign_handler(event):
     """Запуск рассылки"""
     async with client.conversation(event.chat_id, timeout=300) as conv:
         await conv.send_message("🔢 Введите ID черновика:")
-        
         try:
             response = await conv.get_response()
             draft_id = int(response.text)
@@ -649,12 +610,7 @@ async def stop_campaign_handler(event):
     """Остановка рассылки"""
     command_parts = event.text.split()
     if len(command_parts) == 1:
-        # Не указан ID кампании
-        await event.reply(
-            "🛑 Укажите ID рассылки для остановки:\n"
-            "Пример: /stop_campaign 1\n\n"
-            "📋 Список активных: /active_campaigns"
-        )
+        await event.reply("🛑 Укажите ID рассылки: /stop_campaign 1")
         return
     
     try:
@@ -665,10 +621,17 @@ async def stop_campaign_handler(event):
 
 async def main():
     """Основная функция"""
-    logger.info("🚀 Запуск бота массовой рассылки...")
-    await client.start(bot_token=BOT_TOKEN)
-    logger.info("✅ Бот запущен и готов к работе")
-    await client.run_until_disconnected()
+    try:
+        logger.info("🚀 Запуск бота массовой рассылки...")
+        await client.start(bot_token=BOT_TOKEN)
+        
+        # Проверяем что бот работает
+        me = await client.get_me()
+        logger.info(f"✅ Бот @{me.username} запущен и готов к работе")
+        
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
