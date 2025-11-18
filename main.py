@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация из переменных окружения
 API_ID = int(os.getenv('API_ID', '39123927'))
 API_HASH = os.getenv('API_HASH', 'e4395ce4c701ce5524192b0e1f96e7a5')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw')
 
 # Проверка обязательных переменных
 if not BOT_TOKEN:
