@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import random
 import os
+import re
 from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.tl.types import User
@@ -18,15 +19,11 @@ logger = logging.getLogger(__name__)
 # Конфигурация из переменных окружения
 API_ID = int(os.getenv('API_ID', '39123927'))
 API_HASH = os.getenv('API_HASH', 'e4395ce4c701ce5524192b0e1f96e7a5')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8269402325:AAEqO5c2n1C_t1iYOhEcMVg9JK0isIPguOw')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
 # Проверка обязательных переменных
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не установлен! Задайте его в переменных окружения.")
-    exit(1)
-
-if not API_ID or not API_HASH:
-    logger.error("❌ API_ID или API_HASH не установлены!")
     exit(1)
 
 # Инициализация клиента
@@ -42,7 +39,6 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
         
-        # Таблица пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -51,11 +47,11 @@ class DatabaseManager:
                 last_name TEXT,
                 is_bot INTEGER DEFAULT 0,
                 scraped_date TEXT,
-                source_chat TEXT
+                source_chat TEXT,
+                is_active INTEGER DEFAULT 1
             )
         ''')
         
-        # Таблица черновиков
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS drafts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +60,6 @@ class DatabaseManager:
             )
         ''')
         
-        # Таблица отправленных сообщений
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sent_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +73,6 @@ class DatabaseManager:
             )
         ''')
         
-        # Таблица активных рассылок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS campaigns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,8 +129,26 @@ class MassSenderBot:
     def __init__(self):
         self.db = DatabaseManager()
         self.active_campaigns = {}
-        self.base_delay_min = 45  # Минимальная задержка
-        self.base_delay_max = 60  # Максимальная задержка
+        self.base_delay_min = 45
+        self.base_delay_max = 60
+    
+    def is_valid_username(self, username):
+        """Проверка валидности username"""
+        if not username or not isinstance(username, str):
+            return False
+        
+        # Убираем @ в начале если есть
+        username = username.lstrip('@')
+        
+        # Проверяем длину (5-32 символа для Telegram)
+        if len(username) < 5 or len(username) > 32:
+            return False
+        
+        # Проверяем допустимые символы (только буквы, цифры, подчеркивания)
+        if not re.match(r'^[a-zA-Z0-9_]+$', username):
+            return False
+        
+        return True
     
     async def save_draft(self, text, user_id):
         """Сохранение черновика"""
@@ -149,7 +161,7 @@ class MassSenderBot:
             
             await client.send_message(
                 user_id, 
-                f"✅ Черновик сохранен!\nID: {draft_id}\n\nТекст: {text[:100]}..."
+                f"✅ Черновик сохранен!\nID: {draft_id}"
             )
             return draft_id
         except Exception as e:
@@ -189,42 +201,51 @@ class MassSenderBot:
             )
             
             users_added = 0
+            invalid_users = 0
+            
             async for user in client.iter_participants(chat, limit=500):
-                if user.username and not user.bot:
+                if user.username:
+                    # Проверяем валидность username
+                    if not self.is_valid_username(user.username):
+                        invalid_users += 1
+                        continue
+                    
+                    # Пропускаем ботов
+                    if user.bot:
+                        continue
+                    
                     try:
                         self.db.execute_query('''
                             INSERT OR IGNORE INTO users 
-                            (user_id, username, first_name, last_name, is_bot, scraped_date, source_chat)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            (user_id, username, first_name, last_name, is_bot, scraped_date, source_chat, is_active)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             user.id, user.username,
                             user.first_name or '',
                             user.last_name or '',
                             0,
                             datetime.now().isoformat(),
-                            getattr(chat, 'title', 'Unknown')
+                            getattr(chat, 'title', 'Unknown'),
+                            1  # is_active
                         ))
                         users_added += 1
                     except Exception as e:
                         continue
             
-            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users')[0]
+            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE is_active = 1')[0] or 0
             
             await client.send_message(
                 user_id,
                 f"✅ Сбор завершен!\n"
                 f"👥 Добавлено новых: {users_added}\n"
-                f"📊 Всего в базе: {total_users}"
+                f"🚫 Пропущено невалидных: {invalid_users}\n"
+                f"📊 Всего активных в базе: {total_users}"
             )
             
         except Exception as e:
             await client.send_message(
                 user_id, 
-                f"❌ Ошибка: {str(e)[:200]}\n\n"
-                "💡 Проверьте:\n"
-                "- Ссылку на чат\n"
-                "- Права доступа\n"
-                "- Участие в чате"
+                f"❌ Ошибка: {str(e)[:200]}"
             )
     
     async def start_campaign(self, draft_id, user_id):
@@ -241,10 +262,12 @@ class MassSenderBot:
             
             message_text = draft[0]
             
+            # Получаем только активных пользователей с валидными username
             users = self.db.fetch_all('''
                 SELECT u.user_id, u.username 
                 FROM users u
                 WHERE u.is_bot = 0 
+                AND u.is_active = 1
                 AND u.user_id NOT IN (
                     SELECT user_id FROM sent_messages WHERE message = ? AND status = 'success'
                 )
@@ -254,10 +277,26 @@ class MassSenderBot:
                 await client.send_message(user_id, "❌ Нет пользователей для отправки")
                 return
             
+            # Дополнительная фильтрация валидных username
+            valid_users = []
+            for user_id, username in users:
+                if self.is_valid_username(username):
+                    valid_users.append((user_id, username))
+                else:
+                    # Помечаем пользователя как неактивного
+                    self.db.execute_query(
+                        'UPDATE users SET is_active = 0 WHERE user_id = ?',
+                        (user_id,)
+                    )
+            
+            if not valid_users:
+                await client.send_message(user_id, "❌ Нет валидных пользователей для отправки")
+                return
+            
             self.db.execute_query('''
                 INSERT INTO campaigns (draft_id, started_date, total_users, current_index)
                 VALUES (?, ?, ?, ?)
-            ''', (draft_id, datetime.now().isoformat(), len(users), 0))
+            ''', (draft_id, datetime.now().isoformat(), len(valid_users), 0))
             
             campaign_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
             
@@ -266,13 +305,12 @@ class MassSenderBot:
                 'admin_id': user_id
             }
             
-            asyncio.create_task(self.run_campaign(campaign_id, user_id, users, message_text))
+            asyncio.create_task(self.run_campaign(campaign_id, user_id, valid_users, message_text))
             
             await client.send_message(
                 user_id,
                 f"🚀 Рассылка #{campaign_id} запущена!\n"
-                f"📝 Сообщение: {message_text[:80]}...\n"
-                f"👥 Получателей: {len(users)}\n"
+                f"👥 Валидных получателей: {len(valid_users)}\n"
                 f"⏳ Задержка: {self.base_delay_min}-{self.base_delay_max} сек\n"
                 f"🛑 Для остановки: /stop_campaign {campaign_id}"
             )
@@ -295,7 +333,7 @@ class MassSenderBot:
                     logger.info(f"🛑 Рассылка {campaign_id} остановлена")
                     break
                 
-                # Обновляем текущий индекс в БД
+                # Обновляем текущий индекс
                 self.db.execute_query(
                     'UPDATE campaigns SET current_index = ? WHERE id = ?',
                     (i, campaign_id)
@@ -311,28 +349,27 @@ class MassSenderBot:
                     failed_count += 1
                     logger.info(f"❌ [{i}/{len(users)}] Пропущен @{username}")
                 
-                # Обновляем статистику в БД
+                # Обновляем статистику
                 self.db.execute_query('''
                     UPDATE campaigns SET sent_count = ?, failed_count = ? WHERE id = ?
                 ''', (success_count, failed_count, campaign_id))
                 
-                # Обновляем прогресс каждые 10 сообщений или каждые 50 для больших рассылок
-                progress_interval = 10 if len(users) <= 100 else 50
+                # Прогресс каждые 10 сообщений
+                progress_interval = 10
                 if i % progress_interval == 0 or i == len(users):
                     await self.update_progress(
                         campaign_id, admin_id, i, len(users), 
                         success_count, failed_count
                     )
                 
-                # Случайная задержка между сообщениями (45-60 секунд)
+                # Задержка только между сообщениями (45-60 секунд)
                 delay = random.randint(self.base_delay_min, self.base_delay_max)
-                logger.info(f"⏳ Ожидание {delay} секунд до следующего сообщения...")
+                logger.info(f"⏳ Ожидание {delay} секунд...")
                 await asyncio.sleep(delay)
                 
             except Exception as e:
-                logger.error(f"❌ Критическая ошибка в кампании {campaign_id} для @{username}: {e}")
+                logger.error(f"❌ Критическая ошибка: {e}")
                 failed_count += 1
-                # Продолжаем со следующим пользователем
                 continue
         
         # Завершаем кампанию
@@ -351,8 +388,18 @@ class MassSenderBot:
         await self.send_final_report(campaign_id, admin_id, success_count, failed_count, len(users))
     
     async def send_message(self, user_id, username, message_text):
-        """Отправка сообщения (ОДНА попытка)"""
+        """Отправка сообщения (ОДНА попытка как в рабочем коде)"""
         try:
+            # Дополнительная проверка username перед отправкой
+            if not self.is_valid_username(username):
+                logger.warning(f"🚫 Невалидный username: @{username}")
+                self.db.execute_query(
+                    'UPDATE users SET is_active = 0 WHERE user_id = ?',
+                    (user_id,)
+                )
+                return False
+            
+            # ОДНА попытка отправки - как в вашем рабочем коде
             await client.send_message(username, message_text)
             
             # Сохраняем успешную отправку
@@ -371,7 +418,28 @@ class MassSenderBot:
             error_msg = str(e)
             logger.warning(f"❌ Ошибка отправки @{username}: {error_msg}")
             
-            # Сохраняем неудачную отправку (пропускаем пользователя)
+            # Обработка ошибок как в вашем рабочем коде
+            if any(x in error_msg for x in ["Invalid peer", "USERNAME_NOT_OCCUPIED", "USER_BLOCKED", "CHAT_WRITE_FORBIDDEN", "PEER_FLOOD"]):
+                # Помечаем пользователя как неактивного
+                self.db.execute_query(
+                    'UPDATE users SET is_active = 0 WHERE user_id = ?',
+                    (user_id,)
+                )
+                logger.info(f"🚫 Пользователь @{username} помечен как неактивный")
+            
+            # Обработка FLOOD_WAIT - ждем указанное время
+            elif "FLOOD_WAIT" in error_msg:
+                try:
+                    wait_time = int(error_msg.split()[-1])
+                    logger.info(f"🚫 FLOOD_WAIT: ожидание {wait_time} секунд...")
+                    await asyncio.sleep(wait_time)
+                except:
+                    logger.info("🚫 FLOOD_WAIT: ожидание 60 секунд...")
+                    await asyncio.sleep(60)
+                # После FLOOD_WAIT продолжаем со следующим пользователем
+                return False
+            
+            # Сохраняем неудачную отправку
             self.db.execute_query('''
                 INSERT INTO sent_messages 
                 (user_id, username, sent_date, message, status, attempts, error_message)
@@ -392,8 +460,7 @@ class MassSenderBot:
                 f"📊 Рассылка #{campaign_id}\n"
                 f"📈 Прогресс: {current}/{total} ({progress:.1f}%)\n"
                 f"✅ Успешно: {success}\n"
-                f"❌ Пропущено: {failed}\n"
-                f"⏱ Задержка: {self.base_delay_min}-{self.base_delay_max} сек"
+                f"❌ Пропущено: {failed}"
             )
         except Exception as e:
             logger.error(f"Ошибка отправки прогресса: {e}")
@@ -408,8 +475,7 @@ class MassSenderBot:
                 f"🎉 Рассылка #{campaign_id} завершена!\n\n"
                 f"✅ Успешно отправлено: {success}\n"
                 f"❌ Пропущено пользователей: {failed}\n"
-                f"📊 Эффективность: {efficiency:.1f}%\n"
-                f"📈 Всего обработано: {total}"
+                f"📊 Эффективность: {efficiency:.1f}%"
             )
         except Exception as e:
             logger.error(f"Ошибка отправки финального отчета: {e}")
@@ -417,33 +483,21 @@ class MassSenderBot:
     async def get_stats(self, user_id):
         """Получение статистики"""
         try:
-            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users')[0] or 0
+            total_users = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE is_active = 1')[0] or 0
             total_sent = self.db.fetch_one(
                 'SELECT COUNT(*) FROM sent_messages WHERE status = "success"'
             )[0] or 0
             total_campaigns = self.db.fetch_one('SELECT COUNT(*) FROM campaigns')[0] or 0
             total_drafts = self.db.fetch_one('SELECT COUNT(*) FROM drafts')[0] or 0
             
-            active_campaigns = self.db.fetch_all(
-                'SELECT id, total_users, sent_count, failed_count FROM campaigns WHERE status = "running"'
-            )
-            
-            stats_message = (
+            await client.send_message(
+                user_id,
                 f"📊 Статистика бота:\n\n"
-                f"👥 Пользователей в базе: {total_users}\n"
+                f"👥 Активных пользователей: {total_users}\n"
                 f"📤 Успешно отправлено: {total_sent}\n"
                 f"📝 Проведено рассылок: {total_campaigns}\n"
-                f"📄 Черновиков: {total_drafts}\n"
-                f"⏱ Задержка между сообщениями: {self.base_delay_min}-{self.base_delay_max} сек"
+                f"📄 Черновиков: {total_drafts}"
             )
-            
-            if active_campaigns:
-                stats_message += f"\n\n🚀 Активные рассылки: {len(active_campaigns)}"
-                for camp_id, total, sent, failed in active_campaigns:
-                    progress = (sent / total) * 100 if total > 0 else 0
-                    stats_message += f"\n• #{camp_id}: {sent}/{total} ({progress:.1f}%)"
-            
-            await client.send_message(user_id, stats_message)
         except Exception as e:
             await client.send_message(user_id, f"❌ Ошибка получения статистики: {e}")
     
@@ -454,64 +508,14 @@ class MassSenderBot:
             
             if campaign_id in self.active_campaigns:
                 self.active_campaigns[campaign_id]['status'] = 'stopped'
-                
-                self.db.execute_query(
-                    'UPDATE campaigns SET status = "stopped" WHERE id = ?',
-                    (campaign_id,)
-                )
-                
-                await client.send_message(
-                    user_id, 
-                    f"🛑 Рассылка #{campaign_id} остановлена!\n"
-                    f"⏳ Завершаем текущее сообщение..."
-                )
-                logger.info(f"Рассылка #{campaign_id} остановлена")
+                await client.send_message(user_id, f"🛑 Рассылка #{campaign_id} остановлена!")
             else:
-                campaign = self.db.fetch_one(
-                    'SELECT status FROM campaigns WHERE id = ?', 
-                    (campaign_id,)
-                )
-                if campaign:
-                    status = campaign[0]
-                    if status == 'completed':
-                        await client.send_message(user_id, f"✅ Рассылка #{campaign_id} уже завершена")
-                    elif status == 'stopped':
-                        await client.send_message(user_id, f"🛑 Рассылка #{campaign_id} уже остановлена")
-                    else:
-                        await client.send_message(user_id, f"❌ Рассылка #{campaign_id} не активна")
-                else:
-                    await client.send_message(user_id, f"❌ Рассылка #{campaign_id} не найдена")
+                await client.send_message(user_id, f"❌ Рассылка #{campaign_id} не найдена")
                     
         except ValueError:
             await client.send_message(user_id, "❌ Неверный формат ID кампании")
         except Exception as e:
             await client.send_message(user_id, f"❌ Ошибка остановки: {e}")
-    
-    async def list_active_campaigns(self, user_id):
-        """Список активных рассылок"""
-        try:
-            active_campaigns = self.db.fetch_all(
-                'SELECT id, draft_id, total_users, sent_count, current_index FROM campaigns WHERE status = "running"'
-            )
-            
-            if not active_campaigns:
-                await client.send_message(user_id, "🚫 Активных рассылок нет")
-                return
-            
-            message = "🚀 Активные рассылки:\n\n"
-            for camp_id, draft_id, total, sent, current in active_campaigns:
-                progress = (sent / total) * 100 if total > 0 else 0
-                message += (
-                    f"🆔 #{camp_id}\n"
-                    f"📊 Прогресс: {sent}/{total} ({progress:.1f}%)\n"
-                    f"📍 Текущий: {current}\n"
-                    f"⏱ Задержка: {self.base_delay_min}-{self.base_delay_max} сек\n"
-                    f"🛑 Остановить: /stop_campaign {camp_id}\n\n"
-                )
-            
-            await client.send_message(user_id, message)
-        except Exception as e:
-            await client.send_message(user_id, f"❌ Ошибка: {e}")
 
 # Инициализация бота
 mass_bot = MassSenderBot()
@@ -522,20 +526,15 @@ async def start_handler(event):
     user = await event.get_sender()
     await event.reply(
         f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для автоматической массовой рассылки в Telegram.\n\n"
-        "📋 Основные команды:\n"
-        "/add_chat - Добавить пользователей из чата\n"
+        "Я бот для автоматической массовой рассылки.\n\n"
+        "📋 Команды:\n"
+        "/add_chat - Добавить пользователей\n"
         "/save_draft - Сохранить сообщение\n"
         "/list_drafts - Список сообщений\n"
         "/start_campaign - Начать рассылку\n"
-        "/active_campaigns - Активные рассылки\n"
         "/stats - Статистика\n"
-        "/stop_campaign ID - Остановить рассылку\n"
-        "/help - Помощь\n\n"
-        "⚡ Особенности:\n"
-        "• ОДНА попытка отправки - при ошибке пользователь пропускается\n"
-        "• Задержка 45-60 секунд между сообщениями\n"
-        "• Без дополнительных задержек при ошибках"
+        "/stop_campaign ID - Остановить\n"
+        "/help - Помощь"
     )
 
 @client.on(events.NewMessage(pattern='/help'))
@@ -543,22 +542,21 @@ async def help_handler(event):
     """Обработчик команды /help"""
     await event.reply(
         "📖 Инструкция:\n\n"
-        "1. /add_chat - добавить пользователей из чата\n"
-        "2. /save_draft - сохранить текст рассылки\n"
-        "3. /start_campaign - начать рассылку\n"
-        "4. /stop_campaign ID - остановить рассылку\n\n"
-        "⚡ Особенности работы:\n"
-        "• При первой же ошибке пользователь пропускается\n"
-        "• Задержка между сообщениями: 45-60 секунд\n"
-        "• Нет дополнительных задержек при ошибках\n"
-        "• Можно остановить рассылку в любой момент"
+        "1. /add_chat - добавить пользователей\n"
+        "2. /save_draft - сохранить текст\n"
+        "3. /start_campaign - начать рассылку\n\n"
+        "⚡ Особенности:\n"
+        "• ОДНА попытка отправки на пользователя\n"
+        "• Пропуск невалидных пользователей\n"
+        "• Задержка 45-60 секунд между сообщениями\n"
+        "• Автоматическая обработка ошибок"
     )
 
 @client.on(events.NewMessage(pattern='/add_chat'))
 async def add_chat_handler(event):
     """Добавление пользователей из чата"""
     async with client.conversation(event.chat_id, timeout=300) as conv:
-        await conv.send_message("🔗 Пришлите ссылку на чат/канал:")
+        await conv.send_message("🔗 Пришлите ссылку на чат:")
         try:
             response = await conv.get_response()
             await mass_bot.add_users_from_chat(response.text, event.chat_id)
@@ -600,11 +598,6 @@ async def stats_handler(event):
     """Статистика"""
     await mass_bot.get_stats(event.chat_id)
 
-@client.on(events.NewMessage(pattern='/active_campaigns'))
-async def active_campaigns_handler(event):
-    """Список активных рассылок"""
-    await mass_bot.list_active_campaigns(event.chat_id)
-
 @client.on(events.NewMessage(pattern=r'/stop_campaign(\s+\d+)?'))
 async def stop_campaign_handler(event):
     """Остановка рассылки"""
@@ -625,7 +618,6 @@ async def main():
         logger.info("🚀 Запуск бота массовой рассылки...")
         await client.start(bot_token=BOT_TOKEN)
         
-        # Проверяем что бот работает
         me = await client.get_me()
         logger.info(f"✅ Бот @{me.username} запущен и готов к работе")
         
